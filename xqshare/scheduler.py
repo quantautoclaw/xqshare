@@ -119,13 +119,27 @@ class DataDownloadScheduler:
         today = dt.date.today()
         end = today + dt.timedelta(days=370)
         for market in self._split_env("XQSHARE_PREFETCH_MARKETS", ["SH", "SZ"]):
+            # 优先使用 get_trading_dates（get_trading_calendar 某些账户不支持）
             await self._run_task(
                 "trading calendar: %s" % market,
-                self.xtdata.get_trading_calendar,
+                self.xtdata.get_trading_dates,
                 market,
                 today.strftime("%Y%m%d"),
                 end.strftime("%Y%m%d"),
             )
+
+    def _call_trading_dates_fallback(self, market, start_date, end_date):
+        """调用 get_trading_dates，fallback 到 get_trading_calendar"""
+        try:
+            result = self.xtdata.get_trading_dates(market, start_date, end_date)
+            if result:
+                return result
+        except Exception:
+            pass
+        try:
+            return self.xtdata.get_trading_calendar(market, start_date, end_date)
+        except Exception:
+            return []
 
     async def _prefetch_financial_data(self, stocks):
         if not stocks or not hasattr(self.xtdata, "download_financial_data"):

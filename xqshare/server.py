@@ -473,8 +473,18 @@ class XtQuantService(rpyc.Service):
         self._require_auth()
         self._check_api_permission(method, args, kwargs)
         api = self._get_data_api()
+        start_time = time.perf_counter()
         result = getattr(api, method)(*args, **kwargs)
-        return _serialize_for_transfer(result)
+        api_elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+        serialized = _serialize_for_transfer(result)
+        total_elapsed_ms = (time.perf_counter() - start_time) * 1000
+        marker = serialized.get(SERIALIZED_MARKER) if isinstance(serialized, dict) else None
+        api_logger.info(
+            f"[DATA_API] {method} | compute={api_elapsed_ms:.2f}ms | total={total_elapsed_ms:.2f}ms | "
+            f"marker={marker or 'raw'} | result={_summarize_result(result)}"
+        )
+        return serialized
 
     # ==================== 认证接口 ====================
 
@@ -811,10 +821,12 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
         XtQuantService._data_api = DataAPI(xtdata)
 
     scheduler_enabled = os.environ.get("XQSHARE_SCHEDULER_ENABLED", "1").lower() not in ("0", "false", "no")
+    scheduler_run_on_start = os.environ.get("XQSHARE_SCHEDULER_RUN_ON_START", "0").lower() in ("1", "true", "yes")
     if scheduler_enabled and XtQuantService._scheduler is None:
         XtQuantService._scheduler = DataDownloadScheduler(
             xtdata,
             data_api=XtQuantService._data_api,
+            run_on_start=scheduler_run_on_start,
             logger=logger,
         )
         XtQuantService._scheduler.start()

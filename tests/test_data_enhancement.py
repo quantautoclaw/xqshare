@@ -8,10 +8,25 @@ from xqshare.auth import AccountLevel, Permission, PermissionChecker, Permission
 from xqshare.client import XtQuantRemote
 from xqshare.server import XtQuantService, _serialize_for_transfer
 from xqshare.client import _deserialize_from_transfer
-from xqshare.tools.data_api import DataAPI
+from xqshare.tools.data_api import DataAPI, call_xtdata
+
+
+class _NetrefLikePayload:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def __getitem__(self, key):
+        return self._payload[key]
 
 
 class TestDataAPI:
+    def test_call_xtdata_reuses_dedicated_worker_thread(self):
+        first = call_xtdata(lambda: __import__("threading").get_ident())
+        second = call_xtdata(lambda: __import__("threading").get_ident())
+
+        assert first == second
+        assert first != __import__("threading").get_ident()
+
     def test_get_daily_bars_flattens_market_data_ex(self):
         xtdata = MagicMock()
         xtdata.get_market_data_ex.return_value = {
@@ -58,6 +73,7 @@ class TestDataAPI:
 
     def test_get_trading_calendar_returns_datetimes(self):
         xtdata = MagicMock()
+        xtdata.get_trading_dates.return_value = []
         xtdata.get_trading_calendar.return_value = ["20260518", "20260519"]
 
         result = DataAPI(xtdata).get_trading_calendar("20260518", "20260519")
@@ -116,13 +132,19 @@ class TestDataEnhancementServer:
 
 
 class TestDataEnhancementClient:
+    def test_deserialize_netref_like_payload(self):
+        payload = _NetrefLikePayload({"__xqshare_serialized__": "json", "data": '["20260518"]'})
+        result = _deserialize_from_transfer(payload)
+
+        assert result == ["20260518"]
+
     @patch("xqshare.client.rpyc.connect")
     @patch("xqshare.client.BgServingThread")
     def test_client_get_daily_bars_deserializes_dataframe(self, _bg_thread, mock_connect):
         frame = pd.DataFrame({"stock_code": ["000001.SZ"], "close": [10.5]})
         mock_conn = MagicMock()
         mock_conn.root.authenticate.return_value = {"success": True, "level": "standard"}
-        mock_conn.root.get_daily_bars.return_value = _serialize_for_transfer(frame)
+        mock_conn.root.exposed_get_daily_bars.return_value = _serialize_for_transfer(frame)
         mock_connect.return_value = mock_conn
 
         client = XtQuantRemote(host="localhost", heartbeat_interval=0)

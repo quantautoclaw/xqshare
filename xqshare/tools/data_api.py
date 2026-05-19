@@ -12,17 +12,42 @@ import datetime as dt
 import os
 import shutil
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Iterable, Optional, Union
 
 
-_XTDATA_LOCK = threading.RLock()
+_XTDATA_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="xqshare-xtdata")
+_XTDATA_WORKER_IDENT = None
+_XTDATA_WORKER_IDENT_LOCK = threading.Lock()
 
 
 def call_xtdata(func, *args, **kwargs):
-    """Run an xtdata call under the process-wide serialization lock."""
-    with _XTDATA_LOCK:
+    """Run xtdata calls on a dedicated single worker thread.
+
+    A plain lock only serializes calls; it does not keep them on the same OS
+    thread. Some xtquant APIs appear sensitive to thread affinity, especially
+    when invoked from RPyC worker threads, so we marshal every xtdata call onto
+    one long-lived executor thread.
+    """
+    global _XTDATA_WORKER_IDENT
+
+    current_ident = threading.get_ident()
+    with _XTDATA_WORKER_IDENT_LOCK:
+        worker_ident = _XTDATA_WORKER_IDENT
+
+    if worker_ident is not None and current_ident == worker_ident:
         return func(*args, **kwargs)
+
+    future = _XTDATA_EXECUTOR.submit(_xtdata_call_entry, func, args, kwargs)
+    return future.result()
+
+
+def _xtdata_call_entry(func, args, kwargs):
+    global _XTDATA_WORKER_IDENT
+    with _XTDATA_WORKER_IDENT_LOCK:
+        _XTDATA_WORKER_IDENT = threading.get_ident()
+    return func(*args, **kwargs)
 
 
 def _require_pandas():

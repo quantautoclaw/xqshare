@@ -76,6 +76,19 @@ def get_logger():
 # ==================== 反序列化传输数据 ====================
 
 SERIALIZED_MARKER = "__xqshare_serialized__"
+KNOWN_SERIALIZED_TYPES = {"none", "json", "dataframe_csv", "dict_with_dataframe"}
+
+
+def _extract_serialized_payload(result):
+    """Extract serialized transport payload from local dicts or RPyC netrefs."""
+    try:
+        marker = result[SERIALIZED_MARKER]
+        data = result["data"]
+    except Exception:
+        return None, None
+    if not isinstance(marker, str) or marker not in KNOWN_SERIALIZED_TYPES:
+        return None, None
+    return marker, data
 
 
 def _deserialize_from_transfer(result):
@@ -87,12 +100,9 @@ def _deserialize_from_transfer(result):
     Returns:
         反序列化后的 Python 对象
     """
-    # 检查是否为序列化数据
-    if not isinstance(result, dict) or SERIALIZED_MARKER not in result:
+    serialized_type, data = _extract_serialized_payload(result)
+    if serialized_type is None:
         return result
-
-    serialized_type = result[SERIALIZED_MARKER]
-    data = result["data"]
 
     if serialized_type == "none":
         return None
@@ -606,7 +616,54 @@ class XtQuantRemote:
         self._ensure_connected()
         # RPyC exposes methods with "exposed_" prefix
         method = getattr(self._conn.root, f"exposed_{method_name}")
-        return _deserialize_from_transfer(method(*args))
+        start_time = time.perf_counter()
+        self._logger.info(f"[CALL] root.{method_name} args={self._summarize_root_args(args)}")
+        raw_result = method(*args)
+        call_elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+        marker, _ = _extract_serialized_payload(raw_result)
+        self._logger.info(
+            f"[RECV] root.{method_name} | {call_elapsed_ms:.2f}ms | "
+            f"type={type(raw_result).__name__} | marker={marker or 'none'}"
+        )
+
+        deserialize_start = time.perf_counter()
+        result = _deserialize_from_transfer(raw_result)
+        deserialize_elapsed_ms = (time.perf_counter() - deserialize_start) * 1000
+        total_elapsed_ms = (time.perf_counter() - start_time) * 1000
+        self._logger.info(
+            f"[OK] root.{method_name} | total={total_elapsed_ms:.2f}ms | "
+            f"deserialize={deserialize_elapsed_ms:.2f}ms | result={self._summarize_root_result(result)}"
+        )
+        return result
+
+    def _summarize_root_args(self, args, max_len: int = 120) -> str:
+        parts = []
+        for arg in args[:4]:
+            try:
+                if isinstance(arg, (list, tuple)):
+                    parts.append(f"{type(arg).__name__}[len={len(arg)}]")
+                else:
+                    parts.append(str(arg)[:40])
+            except Exception:
+                parts.append("?")
+        if len(args) > 4:
+            parts.append(f"...+{len(args) - 4}")
+        return ", ".join(parts)[:max_len]
+
+    def _summarize_root_result(self, result, max_len: int = 120) -> str:
+        try:
+            if result is None:
+                return "None"
+            if isinstance(result, list):
+                preview = ",".join(str(item)[:16] for item in result[:3])
+                suffix = "..." if len(result) > 3 else ""
+                return f"list[len={len(result)}:{preview}{suffix}]"
+            if isinstance(result, dict):
+                return f"dict[{len(result)} keys]"
+            return str(type(result).__name__)[:max_len]
+        except Exception:
+            return "?"
 
     def get_daily_bars(self, stock_list, start_date, end_date):
         return self._call_root_data_api("get_daily_bars", stock_list, start_date, end_date)
@@ -645,6 +702,10 @@ class XtQuantRemote:
 
     def get_suspended_days(self, stock_list, start_date, end_date):
         return self._call_root_data_api("get_suspended_days", stock_list, start_date, end_date)
+
+    def ping(self):
+        self._ensure_connected()
+        return self._conn.root.ping()
 
     def is_connected(self):
         return self._connected
