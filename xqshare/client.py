@@ -151,6 +151,26 @@ class CallbackError(Exception):
     pass
 
 
+class CallbackServer:
+    """Small local callback registry kept for backward compatibility."""
+
+    def __init__(self, port=0):
+        self.port = port
+        self._callbacks = {}
+
+    def register(self, callback_id: str, callback):
+        self._callbacks[callback_id] = callback
+
+    def unregister(self, callback_id: str):
+        self._callbacks.pop(callback_id, None)
+
+    def _invoke_callback(self, callback_id: str, *args, **kwargs):
+        callback = self._callbacks.get(callback_id)
+        if callback is None:
+            raise CallbackError(f"callback not found: {callback_id}")
+        return callback(*args, **kwargs)
+
+
 # ==================== 重连策略 ====================
 
 class ReconnectPolicy:
@@ -347,12 +367,15 @@ class XtQuantRemote:
         self._authenticated = False
         self._connected = False
         self._reconnecting = False
+        self._token = None
+        self._subscriptions = []
         self._heartbeat_thread = None
         self._stop_heartbeat = threading.Event()
         self._bg_thread = None  # BgServingThread for async callbacks
         self._account_level = None  # 账号等级
 
         self._xtdata = RemoteModule(self, 'xtdata')
+        self._xttrader = RemoteModule(self, 'xttrader')
         self._xttype = RemoteModule(self, 'xttype')
         self._xtconstant = RemoteModule(self, 'xtconstant')
         self._xtview = RemoteModule(self, 'xtview')
@@ -418,8 +441,10 @@ class XtQuantRemote:
                 # 处理认证响应（支持新格式）
                 if isinstance(result, dict):
                     self._account_level = result.get("level", "free")
+                    self._token = result.get("token")
                     self._logger.info(f"认证成功: client_id={self._client_id} | level={self._account_level}")
                 else:
+                    self._token = result
                     self._logger.info(f"认证成功: client_id={self._client_id}")
 
             if self._heartbeat_interval > 0:
@@ -519,6 +544,10 @@ class XtQuantRemote:
         return self._xtdata
 
     @property
+    def xttrader(self):
+        return self._xttrader
+
+    @property
     def xttype(self):
         return self._xttype
 
@@ -572,6 +601,50 @@ class XtQuantRemote:
         """
         self._ensure_connected()
         return self._conn.root.download_history_data2(stock_list, period, start_time, end_time, incrementally)
+
+    def _call_root_data_api(self, method_name: str, *args):
+        self._ensure_connected()
+        # RPyC exposes methods with "exposed_" prefix
+        method = getattr(self._conn.root, f"exposed_{method_name}")
+        return _deserialize_from_transfer(method(*args))
+
+    def get_daily_bars(self, stock_list, start_date, end_date):
+        return self._call_root_data_api("get_daily_bars", stock_list, start_date, end_date)
+
+    def get_minute_bars(self, stock_list, period, start_date, end_date):
+        return self._call_root_data_api("get_minute_bars", stock_list, period, start_date, end_date)
+
+    def get_realtime_quote(self, stock_list):
+        return self._call_root_data_api("get_realtime_quote", stock_list)
+
+    def get_instruments(self, stock_list):
+        return self._call_root_data_api("get_instruments", stock_list)
+
+    def get_trading_calendar(self, start_date, end_date, market: str = "SH"):
+        return self._call_root_data_api("get_trading_calendar", start_date, end_date, market)
+
+    def get_financial_data(self, stock_list, table_list, start_date: str = "", end_date: str = "",
+                           report_type: str = "report_time"):
+        return self._call_root_data_api(
+            "get_financial_data",
+            stock_list,
+            table_list,
+            start_date,
+            end_date,
+            report_type,
+        )
+
+    def get_etf_info(self):
+        return self._call_root_data_api("get_etf_info")
+
+    def get_index_weight(self, index_code):
+        return self._call_root_data_api("get_index_weight", index_code)
+
+    def get_yield_curve(self, date):
+        return self._call_root_data_api("get_yield_curve", date)
+
+    def get_suspended_days(self, stock_list, start_date, end_date):
+        return self._call_root_data_api("get_suspended_days", stock_list, start_date, end_date)
 
     def is_connected(self):
         return self._connected

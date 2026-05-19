@@ -19,6 +19,7 @@ from .client import (
     ConnectionError,
     AuthenticationError,
     CallbackError,
+    CallbackServer,
 )
 
 __all__ = [
@@ -33,4 +34,5 @@ __all__ = [
     "ConnectionError",
     "AuthenticationError",
     "CallbackError",
+    "CallbackServer",
 ]

@@ -10,6 +10,8 @@ import ssl
 import logging
 import functools
 import json
+import hmac
+import hashlib
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -21,6 +23,8 @@ from .auth import (
     Permission,
     get_permission_checker,
 )
+from .scheduler import DataDownloadScheduler
+from .tools.data_api import DataAPI, call_xtdata
 
 # Import xtquant (only available on Windows)
 try:
@@ -88,8 +92,8 @@ def setup_logging(log_dir: str = None, log_level: str = "INFO"):
     return logging.getLogger(__name__)
 
 
-logger = None
-api_logger = None
+logger = logging.getLogger(__name__)
+api_logger = logging.getLogger('api')
 
 
 def _init_logging(log_level="INFO"):
@@ -161,6 +165,42 @@ def _summarize_result(result: Any, max_len: int = 200) -> str:
 class AuthError(Exception):
     """认证错误"""
     pass
+
+
+class CallbackManager:
+    """Compatibility callback registry used by older clients and tests."""
+
+    def __init__(self):
+        self._callbacks = {}
+
+    def register(self, callback_id: str, callback, client_info: str = ""):
+        self._callbacks[callback_id] = {
+            "callback": callback,
+            "client_info": client_info,
+            "created_at": time.time(),
+        }
+
+    def unregister(self, callback_id: str):
+        self._callbacks.pop(callback_id, None)
+
+    def invoke(self, callback_id: str, *args, **kwargs) -> bool:
+        item = self._callbacks.get(callback_id)
+        if item is None:
+            return False
+        try:
+            item["callback"](*args, **kwargs)
+            return True
+        except Exception:
+            self.unregister(callback_id)
+            return False
+
+    def list_callbacks(self):
+        return list(self._callbacks.keys())
+
+    def clear_client_callbacks(self, client_info: str):
+        for callback_id, item in list(self._callbacks.items()):
+            if item.get("client_info") == client_info:
+                self.unregister(callback_id)
 
 
 # ==================== 序列化传输优化 ====================
@@ -282,7 +322,12 @@ class LoggingProxy:
                         api_logger.warning(f"[权限拒绝] {full_name} | client={get_client_info()} | {error}")
                         raise error
 
-                result = _log_call(full_name, get_client_info(), attr, *args, **kwargs)
+                def invoke(*call_args, **call_kwargs):
+                    if target_name == "xtdata":
+                        return call_xtdata(attr, *call_args, **call_kwargs)
+                    return attr(*call_args, **call_kwargs)
+
+                result = _log_call(full_name, get_client_info(), invoke, *args, **kwargs)
 
                 # 如果返回的是复杂对象（非基本类型），递归包装
                 if result is not None and hasattr(result, '__class__'):
@@ -330,17 +375,23 @@ LoggingModuleProxy = LoggingProxy
 class XtQuantService(rpyc.Service):
     """完全透明代理服务"""
 
+    AUTH_KEY = os.environ.get("XQSHARE_AUTH_KEY", "xqshare-default-auth-key")
     _xtdata = xtdata
     _xttrader = xttrader
     _xttype = xttype
     _xtconstant = xtconstant
     _xtview = xtview
     _permission_checker = None  # 类级别的权限检查器
+    _data_api = None
+    _scheduler = None
+    _tokens = {}
+    _callback_manager = CallbackManager()
 
     def on_connect(self, conn):
         self._conn = conn
         self._authenticated = False
         self._client_id = None
+        self._token = None
         self._account_level = AccountLevel.FREE  # 默认为免费等级
         # 权限检查器在服务启动时已加载
         # 兼容不同版本 rpyc：尝试获取客户端地址
@@ -363,6 +414,13 @@ class XtQuantService(rpyc.Service):
     def on_disconnect(self, conn):
         client_info = getattr(self, '_client_info', 'unknown')
         logger.info(f"[断开] 客户端离开: {client_info}")
+        token = getattr(self, "_token", None)
+        if token:
+            tokens = getattr(self, "_tokens", XtQuantService._tokens)
+            tokens.pop(token, None)
+            if tokens is not XtQuantService._tokens:
+                XtQuantService._tokens.pop(token, None)
+        XtQuantService._callback_manager.clear_client_callbacks(client_info)
 
     def _delayed_disconnect(self, delay: float = 0.5):
         """延迟断开连接，确保异常能传输到客户端"""
@@ -381,17 +439,62 @@ class XtQuantService(rpyc.Service):
             self._delayed_disconnect()
             raise AuthError("未授权访问，请先认证")
 
+    def _generate_token(self, client_id: str) -> str:
+        timestamp = str(int(time.time()))
+        message = f"{client_id}:{timestamp}".encode()
+        signature = hmac.new(self.AUTH_KEY.encode(), message, hashlib.sha256).hexdigest()
+        return f"{client_id}:{timestamp}:{signature}"
+
+    def _verify_token(self, token: str) -> bool:
+        try:
+            client_id, timestamp, signature = token.split(":")
+            if time.time() - int(timestamp) > 3600:
+                return False
+            message = f"{client_id}:{timestamp}".encode()
+            expected = hmac.new(self.AUTH_KEY.encode(), message, hashlib.sha256).hexdigest()
+            return hmac.compare_digest(signature, expected)
+        except Exception:
+            return False
+
+    def _check_api_permission(self, method: str, args: tuple = (), kwargs: dict = None):
+        checker = XtQuantService._permission_checker or get_permission_checker()
+        XtQuantService._permission_checker = checker
+        error = checker.check_api_permission(self._account_level, method, args, kwargs or {})
+        if error:
+            logger.warning(f"[权限拒绝] {method} | client={self._client_info} | {error}")
+            raise error
+
+    def _get_data_api(self):
+        if XtQuantService._data_api is None:
+            XtQuantService._data_api = DataAPI(self._xtdata)
+        return XtQuantService._data_api
+
+    def _call_data_api(self, method: str, *args, **kwargs):
+        self._require_auth()
+        self._check_api_permission(method, args, kwargs)
+        api = self._get_data_api()
+        result = getattr(api, method)(*args, **kwargs)
+        return _serialize_for_transfer(result)
+
     # ==================== 认证接口 ====================
 
     @log_api_call("authenticate")
     def exposed_authenticate(self, client_id, client_secret):
         checker = XtQuantService._permission_checker
+        if checker is None:
+            checker = get_permission_checker()
+            XtQuantService._permission_checker = checker
 
         # 检查配置文件是否变更，如果变更则重新加载
         checker.check_and_reload_if_changed()
 
         # 验证密钥并获取账号等级
         valid, account_level = checker.verify_secret(client_id, client_secret)
+        if not valid and getattr(checker, "_use_default_client", False):
+            default_secret = os.environ.get("XQSHARE_CLIENT_SECRET")
+            if default_secret and client_secret == default_secret:
+                valid = True
+                account_level = AccountLevel.FREE
 
         if not valid:
             logger.warning(f"[认证失败] client_id={client_id}")
@@ -401,9 +504,15 @@ class XtQuantService(rpyc.Service):
         self._authenticated = True
         self._client_id = client_id
         self._account_level = account_level
-        self._client_info = f"{client_id}@{self._client_info}"
+        self._token = self._generate_token(client_id)
+        XtQuantService._tokens[self._token] = {
+            "client_id": client_id,
+            "level": account_level.value,
+            "created_at": time.time(),
+        }
+        self._client_info = f"{client_id}@{getattr(self, '_client_info', 'unknown')}"
         logger.info(f"[认证成功] client_id={client_id} | level={account_level.value}")
-        return {"success": True, "level": account_level.value}
+        return {"success": True, "level": account_level.value, "token": self._token}
 
     @log_api_call("heartbeat")
     def exposed_heartbeat(self):
@@ -494,12 +603,62 @@ class XtQuantService(rpyc.Service):
     @log_api_call("get_all_stocks")
     def exposed_get_all_stocks(self):
         self._require_auth()
-        return self._xtdata.get_stock_list_in_sector("沪深A股")
+        return call_xtdata(self._xtdata.get_stock_list_in_sector, "沪深A股")
 
     @log_api_call("get_index_list")
     def exposed_get_index_list(self):
         self._require_auth()
-        return self._xtdata.get_stock_list_in_sector("沪深指数")
+        return call_xtdata(self._xtdata.get_stock_list_in_sector, "沪深指数")
+
+    # ==================== 显式数据接口 ====================
+
+    @log_api_call("get_daily_bars")
+    def exposed_get_daily_bars(self, stock_list, start_date, end_date):
+        return self._call_data_api("get_daily_bars", stock_list, start_date, end_date)
+
+    @log_api_call("get_minute_bars")
+    def exposed_get_minute_bars(self, stock_list, period, start_date, end_date):
+        return self._call_data_api("get_minute_bars", stock_list, period, start_date, end_date)
+
+    @log_api_call("get_realtime_quote")
+    def exposed_get_realtime_quote(self, stock_list):
+        return self._call_data_api("get_realtime_quote", stock_list)
+
+    @log_api_call("get_instruments")
+    def exposed_get_instruments(self, stock_list):
+        return self._call_data_api("get_instruments", stock_list)
+
+    @log_api_call("get_trading_calendar")
+    def exposed_get_trading_calendar(self, start_date, end_date, market: str = "SH"):
+        return self._call_data_api("get_trading_calendar", start_date, end_date, market)
+
+    @log_api_call("get_financial_data")
+    def exposed_get_financial_data(self, stock_list, table_list, start_date: str = "", end_date: str = "",
+                                   report_type: str = "report_time"):
+        return self._call_data_api(
+            "get_financial_data",
+            stock_list,
+            table_list,
+            start_date,
+            end_date,
+            report_type,
+        )
+
+    @log_api_call("get_etf_info")
+    def exposed_get_etf_info(self):
+        return self._call_data_api("get_etf_info")
+
+    @log_api_call("get_index_weight")
+    def exposed_get_index_weight(self, index_code):
+        return self._call_data_api("get_index_weight", index_code)
+
+    @log_api_call("get_yield_curve")
+    def exposed_get_yield_curve(self, date):
+        return self._call_data_api("get_yield_curve", date)
+
+    @log_api_call("get_suspended_days")
+    def exposed_get_suspended_days(self, stock_list, start_date, end_date):
+        return self._call_data_api("get_suspended_days", stock_list, start_date, end_date)
 
     # ==================== 服务端封装接口 ====================
 
@@ -510,6 +669,12 @@ class XtQuantService(rpyc.Service):
         下载历史数据（服务端封装，避免回调传输问题）
         返回: {'finished': n, 'total': n, 'result': {...}}
         """
+        self._require_auth()
+        self._check_api_permission(
+            "download_history_data2",
+            (stock_list, period, start_time, end_time),
+            {"incrementally": incrementally},
+        )
         status = {'finished': 0, 'total': 0, 'done': False, 'result': {}, 'message': ''}
 
         def on_progress(data):
@@ -528,7 +693,8 @@ class XtQuantService(rpyc.Service):
 
         # 调用原始方法（incrementally 参数需要转换为 None 或 bool）
         inc = incrementally
-        self._xtdata.download_history_data2(
+        call_xtdata(
+            self._xtdata.download_history_data2,
             stock_list, period, start_time, end_time,
             callback=on_progress, incrementally=inc
         )
@@ -543,6 +709,11 @@ class XtQuantService(rpyc.Service):
         return {
             "uptime": time.time() - getattr(self, '_start_time', time.time()),
             "client_id": self._client_id,
+            "active_tokens": len(XtQuantService._tokens),
+            "active_callbacks": len(XtQuantService._callback_manager.list_callbacks()),
+            "scheduler_running": bool(
+                XtQuantService._scheduler and XtQuantService._scheduler.is_running
+            ),
         }
 
     @log_api_call("ping")
@@ -636,6 +807,18 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
     if XtQuantService._permission_checker is None:
         XtQuantService._permission_checker = get_permission_checker()
 
+    if XtQuantService._data_api is None:
+        XtQuantService._data_api = DataAPI(xtdata)
+
+    scheduler_enabled = os.environ.get("XQSHARE_SCHEDULER_ENABLED", "1").lower() not in ("0", "false", "no")
+    if scheduler_enabled and XtQuantService._scheduler is None:
+        XtQuantService._scheduler = DataDownloadScheduler(
+            xtdata,
+            data_api=XtQuantService._data_api,
+            logger=logger,
+        )
+        XtQuantService._scheduler.start()
+
     logger.info(f"服务启动 | host={host} | port={port} | ssl={use_ssl}")
     
     config = {
@@ -701,6 +884,10 @@ def start_server(host="0.0.0.0", port=None, use_ssl=False, certfile=None, keyfil
     except Exception as e:
         logger.error(f"服务异常: {e}")
         raise
+    finally:
+        if XtQuantService._scheduler is not None:
+            XtQuantService._scheduler.stop()
+            XtQuantService._scheduler = None
 
 
 def main():

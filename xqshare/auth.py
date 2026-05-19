@@ -18,6 +18,7 @@ class Permission(Enum):
     DAILY = "daily"        # 日线数据
     MINUTE = "minute"      # 分钟线数据
     TICK = "tick"          # 实时行情
+    STANDARD = "standard"  # 标准级数据能力
     TRADE_QUERY = "trade_query"  # 交易查询权限（持仓、资产、委托等）
     TRADE_ORDER = "trade_order"  # 完整交易权限（查询+下单+撤单）
     CALLBACK = "callback"  # 回调功能
@@ -36,9 +37,9 @@ class AccountLevel(Enum):
 LEVEL_PERMISSIONS: Dict[AccountLevel, Set[Permission]] = {
     AccountLevel.FREE: {Permission.BASIC, Permission.DAILY},
     AccountLevel.PLUS: {Permission.BASIC, Permission.DAILY, Permission.MINUTE},
-    AccountLevel.STANDARD: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.CALLBACK},
-    AccountLevel.PREMIUM: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.TRADE_QUERY, Permission.CALLBACK},
-    AccountLevel.ENTERPRISE: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.TRADE_QUERY, Permission.TRADE_ORDER, Permission.CALLBACK},
+    AccountLevel.STANDARD: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.STANDARD, Permission.CALLBACK},
+    AccountLevel.PREMIUM: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.STANDARD, Permission.TRADE_QUERY, Permission.CALLBACK},
+    AccountLevel.ENTERPRISE: {Permission.BASIC, Permission.DAILY, Permission.MINUTE, Permission.TICK, Permission.STANDARD, Permission.TRADE_QUERY, Permission.TRADE_ORDER, Permission.CALLBACK},
 }
 
 # API 与权限的映射关系
@@ -52,6 +53,11 @@ API_PERMISSIONS: Dict[str, Permission] = {
     "xtdata.get_sector_list": Permission.BASIC,
     "get_all_stocks": Permission.BASIC,
     "get_index_list": Permission.BASIC,
+    "get_daily_bars": Permission.BASIC,
+    "get_instruments": Permission.BASIC,
+    "get_trading_calendar": Permission.BASIC,
+    "get_etf_info": Permission.BASIC,
+    "get_index_weight": Permission.BASIC,
 
     # ==================== daily 权限 ====================
     # get_market_data 和 get_market_data_ex 的 period 参数决定权限
@@ -67,10 +73,17 @@ API_PERMISSIONS: Dict[str, Permission] = {
     "xtdata.get_financial_data": Permission.MINUTE,
     "xtdata.download_financial_data": Permission.MINUTE,
     "xtdata.download_financial_data2": Permission.MINUTE,
+    "get_minute_bars": Permission.MINUTE,
+    "get_financial_data": Permission.MINUTE,
 
     # ==================== tick 权限 ====================
     "xtdata.get_full_tick": Permission.TICK,
     "xtdata.subscribe_quote": Permission.TICK,
+    "get_realtime_quote": Permission.TICK,
+
+    # ==================== standard 权限 ====================
+    "get_yield_curve": Permission.STANDARD,
+    "get_suspended_days": Permission.STANDARD,
 
     # ==================== trade 权限 ====================
     # 精确匹配：查询方法需要 TRADE_QUERY
@@ -395,7 +408,7 @@ class PermissionChecker:
             if method in ("xtdata.get_market_data", "xtdata.get_market_data_ex",
                          "xtdata.get_full_kline",
                          "xtdata.download_history_data", "xtdata.download_history_data2",
-                         "download_history_data2"):
+                         "download_history_data2", "get_minute_bars"):
                 period = self._extract_period(args, kwargs)
                 if period in MINUTE_PERIODS:
                     return Permission.MINUTE
